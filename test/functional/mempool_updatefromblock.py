@@ -8,12 +8,14 @@ Test mempool update of transaction descendants/ancestors information (count, siz
 when transactions have been re-added from a disconnected block to the mempool.
 """
 from decimal import Decimal
+from fractions import Fraction
 from math import ceil
 import time
 
 from test_framework.blocktools import create_empty_fork
+from test_framework.messages import COIN
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal, assert_greater_than_or_equal, assert_raises_rpc_error
+from test_framework.util import assert_equal, assert_greater_than, assert_greater_than_or_equal, assert_raises_rpc_error
 from test_framework.wallet import MiniWallet
 from test_framework.mempool_util import DEFAULT_CLUSTER_LIMIT
 
@@ -202,6 +204,91 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
         mempool = self.nodes[0].getrawmempool()
         assert_equal(set(mempool), set([tx["txid"] for tx in chain[:-2]]))
 
+    def test_cluster_trim_by_chunk_feerate(self):
+        self.log.info('Check that an oversized cluster on reorg is trimmed by chunk feerate')
+
+        node = self.nodes[0]
+        wallet = MiniWallet(node)
+        self.generate(wallet, 101)
+
+        assert_equal(node.getrawmempool(), [])
+
+        # Prep fork
+        fork_blocks = create_empty_fork(node)
+
+        # Children of X at distinct feerates of 3..66 sat/vB, a lone cheap child at
+        # 2 sat/vB, and a CPFP pair: a 1 sat/vB child bumped by a 100 sat/vB grandchild.
+        # Once X is resurrected the cluster has 1 + 64 + 1 + 2 = 68 transactions.
+        num_rate_children = DEFAULT_CLUSTER_LIMIT
+        rates = [Decimal("0.00003") + i * Decimal("0.00001") for i in range(num_rate_children)]
+        lone_rate = Decimal("0.00002")
+        cpfp_child_rate = Decimal("0.00001")
+        cpfp_grandchild_rate = Decimal("0.00100")
+
+        tx_x = wallet.send_self_transfer_multi(from_node=node, num_outputs=num_rate_children + 2)
+        self.generate(node, 1)
+        assert_equal(node.getrawmempool(), [])
+
+        # While X is confirmed every child is in its own cluster
+        lone = wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_x["new_utxos"][-1], fee_rate=lone_rate)
+        cpfp_child = wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_x["new_utxos"][-2], fee_rate=cpfp_child_rate)
+        cpfp_grandchild = wallet.send_self_transfer(from_node=node, utxo_to_spend=cpfp_child["new_utxo"], fee_rate=cpfp_grandchild_rate)
+        rate_children = [wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_x["new_utxos"][i], fee_rate=rate)
+                         for i, rate in enumerate(rates)]
+
+        # The cheap child of the CPFP pair pays less than the lone child, so trimming
+        # by individual feerate would evict it (and its child) before the lone one.
+        assert_greater_than(lone_rate, cpfp_child_rate)
+
+        def chunk_feerate(txid):
+            entry = node.getmempoolentry(txid)
+            return Fraction(int(entry["fees"]["chunk"] * COIN), entry["chunkweight"])
+
+        # Chunks of the clusters before the reorg, as (feerate, txids)
+        cpfp_txids = {cpfp_child["txid"], cpfp_grandchild["txid"]}
+        assert_equal(chunk_feerate(cpfp_child["txid"]), chunk_feerate(cpfp_grandchild["txid"]))
+        chunks = [(chunk_feerate(cpfp_child["txid"]), cpfp_txids), (chunk_feerate(lone["txid"]), {lone["txid"]})]
+        chunks += [(chunk_feerate(tx["txid"]), {tx["txid"]}) for tx in rate_children]
+        chunks.sort(key=lambda chunk: chunk[0], reverse=True)
+        # All chunk feerates are distinct, so the expected trim is unambiguous
+        assert_equal(len({feerate for feerate, _ in chunks}), len(chunks))
+
+        # X takes one slot; the highest feerate chunks fill the rest. After the
+        # reorg X is linearized first and may absorb the highest-feerate chunks,
+        # which does not change which chunks end up at the tail.
+        kept_expected = set()
+        evicted_expected = set()
+        for _, txids in chunks:
+            if not evicted_expected and len(kept_expected) + len(txids) <= DEFAULT_CLUSTER_LIMIT - 1:
+                kept_expected |= txids
+            else:
+                evicted_expected |= txids
+        assert_equal(evicted_expected, {lone["txid"]} | {tx["txid"] for tx in rate_children[:3]})
+
+        # 64 rate children, the lone child and the CPFP pair; X makes it 68 after the reorg
+        assert_equal(len(node.getrawmempool()), num_rate_children + 3)
+
+        # Reorg to the empty fork to resurrect X and merge everything into one cluster
+        self.trigger_reorg(fork_blocks=fork_blocks)
+        mempool = set(node.getrawmempool())
+
+        assert tx_x["txid"] in mempool
+        assert_equal(mempool, {tx_x["txid"]} | kept_expected)
+        assert_equal(mempool & evicted_expected, set())
+        assert cpfp_txids <= mempool
+        assert lone["txid"] not in mempool
+
+        # Every evicted chunk pays less than every surviving chunk
+        assert_greater_than(min(feerate for feerate, txids in chunks if txids <= kept_expected),
+                            max(feerate for feerate, txids in chunks if txids <= evicted_expected))
+
+        cluster = node.getmempoolcluster(tx_x["txid"])
+        assert_equal(cluster["txcount"], len(mempool))
+        assert_equal(cluster["txcount"], DEFAULT_CLUSTER_LIMIT)
+
+        self.generate(node, 1)
+        assert_equal(node.getrawmempool(), [])
+
     def run_test(self):
         # Mine in batches of 25 to test multi-block reorg under chain limits
         self.transaction_graph_test(size=DEFAULT_CLUSTER_LIMIT, n_tx_to_mine=[25, 50, 75])
@@ -209,6 +296,8 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
         self.test_max_disconnect_pool_bytes()
 
         self.test_chainlimits_exceeded()
+
+        self.test_cluster_trim_by_chunk_feerate()
 
 if __name__ == '__main__':
     MempoolUpdateFromBlockTest(__file__).main()
